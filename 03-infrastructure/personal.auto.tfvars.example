@@ -1,0 +1,19 @@
+cloud_id                 = "ваш cloud_id "
+folder_id                = "ваш folder_id "
+service_account_key_file = "ваш service_account_key_file"
+public_key_path          = "ваш public_key_path"
+
+sa_name = "diplom-terraform-sa"
+
+# ==================== References to Layer 1 ====================
+state_bucket_name = "diplom-terraform-state"  
+
+# ==================== Reference to Layer 2 (Network) ====================
+network_state_bucket     = "diplom-terraform-state"
+network_state_key        = "02-network/terraform.tfstate"
+network_state_region     = "ru-central1"
+
+# ==================== Ansible ====================
+ansible_repo_url             = "https://github.com/IthnHuitn/ansible-k8s"
+ansible_repo_branch          = "master"
+enable_ansible_provisioner   = true

@@ -1,0 +1,7 @@
+cloud_id                 = "ваш cloud_id "
+folder_id                = "ваш folder_id "
+yc_token                 = "ваш token"
+default_zone             = "ru-central1-a"
+
+sa_name = "diplom-terraform-sa"
+

@@ -1,0 +1,195 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  TF_VAR_cloud_id: ${{ secrets.YC_CLOUD_ID }}
+  TF_VAR_folder_id: ${{ secrets.YC_FOLDER_ID }}
+
+jobs:
+  # ==================== DEPLOY ====================
+  terraform:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      # ==================== Checkout & Clone ====================
+      - name: Checkout infrastructure repo
+        uses: actions/checkout@v4
+
+      - name: Clone ansible-k8s repo
+        run: |
+          git clone https://github.com/IthnHuitn/ansible-k8s.git ansible-k8s
+
+      # ==================== Setup Tools ====================
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.9.0"
+
+      - name: Write SA key to file
+        run: echo '${{ secrets.YC_SA_KEY }}' > /tmp/sa-key.json
+
+      - name: Extract SSH public key
+        run: ssh-add -L > /tmp/id_rsa.pub
+
+      # ==================== Format Check ====================
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      # ==================== 01-bootstrap ====================
+      - name: 01-bootstrap init
+        run: cd 01-bootstrap && terraform init
+        env:
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
+
+      - name: 01-bootstrap validate
+        run: cd 01-bootstrap && terraform validate
+
+      - name: 01-bootstrap plan
+        run: cd 01-bootstrap && terraform plan -input=false
+        env:
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
+
+      - name: 01-bootstrap apply
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: cd 01-bootstrap && terraform apply -auto-approve -input=false
+        env:
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
+
+      # ==================== 02-network ====================
+      - name: 02-network init
+        if: hashFiles('02-network/**/*.tf') != ''
+        run: cd 02-network && terraform init
+
+      - name: 02-network validate
+        if: hashFiles('02-network/**/*.tf') != ''
+        run: cd 02-network && terraform validate
+
+      - name: 02-network plan
+        if: hashFiles('02-network/**/*.tf') != ''
+        run: cd 02-network && terraform plan -input=false
+
+      - name: 02-network apply
+        if: hashFiles('02-network/**/*.tf') != '' && github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: cd 02-network && terraform apply -auto-approve -input=false
+
+      # ==================== 03-infrastructure ====================
+      - name: 03-infrastructure init
+        if: hashFiles('03-infrastructure/**/*.tf') != ''
+        run: cd 03-infrastructure && terraform init
+
+      - name: 03-infrastructure validate
+        if: hashFiles('03-infrastructure/**/*.tf') != ''
+        run: cd 03-infrastructure && terraform validate
+
+      - name: 03-infrastructure plan
+        if: hashFiles('03-infrastructure/**/*.tf') != ''
+        run: cd 03-infrastructure && terraform plan -input=false
+        env:
+          TF_VAR_network_state_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          TF_VAR_network_state_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: 03-infrastructure apply
+        if: hashFiles('03-infrastructure/**/*.tf') != '' && github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: cd 03-infrastructure && terraform apply -auto-approve -input=false -var="enable_ansible_provisioner=false"
+        env:
+          TF_VAR_network_state_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          TF_VAR_network_state_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # ==================== Ansible Provision ====================
+      - name: Install Ansible
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: sudo apt update && sudo apt install -y ansible
+
+      - name: Verify hosts.yml exists
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          echo "Checking for hosts.yml..."
+          cat ansible-k8s/inventory/hosts.yml || echo "NOT FOUND"
+
+      - name: Create .kube directory
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: mkdir -p /home/runner/.kube
+
+      - name: Run Ansible playbook
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          cd ansible-k8s
+          ansible-playbook -i inventory/hosts.yml playbooks/site.yml
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+
+      - name: Fix kubeconfig for external access
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          MASTER_PUBLIC_IP=$(grep -oP 'ansible_host:\s*\K[\d.]+' ansible-k8s/inventory/hosts.yml | head -1)
+          sed -i "s|https://[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+:6443|https://${MASTER_PUBLIC_IP}:6443|g" /home/runner/.kube/config
+          echo "Kubeconfig server set to: ${MASTER_PUBLIC_IP}:6443"    
+
+      - name: Show Terraform outputs
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          echo "=== 03-infrastructure outputs ==="
+          cd 03-infrastructure && terraform output
+          echo "=== 02-network outputs ==="
+          cd ../02-network && terraform output
+
+  # ==================== DESTROY ====================
+  destroy:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infrastructure repo
+        uses: actions/checkout@v4
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.9.0"
+
+      - name: Write SA key to file
+        run: |
+          echo '${{ secrets.YC_SA_KEY }}' > /tmp/sa-key.json
+          echo '${{ secrets.YC_SA_KEY }}' > /tmp/.authorized_key_diplom.json
+
+      - name: Extract SSH public key
+        run: ssh-add -L > /tmp/id_rsa.pub
+
+      - name: Destroy 03-infrastructure
+        run: cd 03-infrastructure && terraform init && terraform destroy -auto-approve -input=false
+        env:
+          TF_VAR_service_account_key_file: /tmp/sa-key.json
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
+          TF_VAR_network_state_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          TF_VAR_network_state_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Destroy 02-network
+        run: cd 02-network && terraform init && terraform destroy -auto-approve -input=false
+        env:
+          TF_VAR_service_account_key_file: /tmp/sa-key.json
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
+
+      - name: Destroy 01-bootstrap
+        run: cd 01-bootstrap && terraform init && terraform destroy -auto-approve -input=false
+        env:
+          TF_VAR_service_account_key_file: /tmp/sa-key.json
+          TF_VAR_yc_sa_key_file: /tmp/sa-key.json
